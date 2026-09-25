@@ -1,15 +1,55 @@
 import struct
 
-HEADER = struct.Struct("!I")          # 4 bytes, big-endian unsigned int
-MAX_MSG = 16 * 1024 * 1024            # refuse absurd lengths
+HEADER = struct.Struct("!II")   # length (4 bytes) + request_id (4 bytes), big-endian
+MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MB safety cap
 
-async def send_msg(writer, payload: bytes) -> None:
-    writer.write(HEADER.pack(len(payload)) + payload)
+
+def encode_msg(request_id: int, payload: bytes) -> bytes:
+    """Build one complete framed message: header + payload."""
+    if len(payload) > MAX_PAYLOAD:
+        raise ValueError(f"payload too large: {len(payload)} bytes")
+    return HEADER.pack(len(payload), request_id) + payload
+
+
+async def send_msg(writer, request_id: int, payload: bytes) -> None:
+    writer.write(encode_msg(request_id, payload))
     await writer.drain()
 
-async def recv_msg(reader) -> bytes:
+
+async def recv_msg(reader):
+    """Read exactly one framed message from an asyncio StreamReader.
+    Returns (request_id, payload).
+    Raises asyncio.IncompleteReadError if the connection closes mid-message.
+    """
     header = await reader.readexactly(HEADER.size)
-    (length,) = HEADER.unpack(header)
-    if length > MAX_MSG:
+    length, request_id = HEADER.unpack(header)
+    if length > MAX_PAYLOAD:
         raise ValueError(f"message too large: {length}")
-    return await reader.readexactly(length)
+    payload = await reader.readexactly(length)
+    return request_id, payload
+
+
+class Decoder:
+    """Incremental decoder for framed messages, for feeding raw bytes
+    that arrive in arbitrary chunks (simulates real TCP behavior),
+    without needing a live socket. Used only by tests."""
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        self._buf.extend(chunk)
+
+    def pop_ready(self):
+        out = []
+        while True:
+            if len(self._buf) < HEADER.size:
+                break
+            length, request_id = HEADER.unpack(self._buf[: HEADER.size])
+            total = HEADER.size + length
+            if len(self._buf) < total:
+                break
+            payload = bytes(self._buf[HEADER.size:total])
+            del self._buf[:total]
+            out.append((request_id, payload))
+        return out

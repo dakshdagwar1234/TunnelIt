@@ -16,6 +16,7 @@ class Tunnel:
         self.closed = asyncio.Event()
 
     def close(self):
+
         self.writer.close()
         self.closed.set()
 
@@ -80,8 +81,8 @@ class Relay:
                 await respond(writer, 502, "No tunnel client connected")
                 return
             try:
-                await send_msg(tunnel.writer, request)
-                response = await recv_msg(tunnel.reader)
+                await send_msg(tunnel.writer, request_id=0, payload=request)
+                _, response = await recv_msg(tunnel.reader)
             except (asyncio.IncompleteReadError, ConnectionError, OSError):
                 tunnel.close()
                 await respond(writer, 502, "Tunnel connection lost")

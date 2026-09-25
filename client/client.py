@@ -26,13 +26,13 @@ async def main(args):
     log.info("connected to relay %s:%d", args.relay_host, args.relay_port)
     while True:
         try:
-            request = await recv_msg(reader)
+            request_id, request = await recv_msg(reader)
         except asyncio.IncompleteReadError:
             log.info("relay closed the tunnel")
             return
         log.info("request: %s", request.split(b"\r\n", 1)[0].decode(errors="replace"))
         response = await forward_to_local(args.local_host, args.local_port, request)
-        await send_msg(writer, response)
+        await send_msg(writer, request_id, response)
 
 
 if __name__ == "__main__":
