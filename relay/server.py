@@ -6,17 +6,19 @@ from protocol.basic import send_msg, recv_msg
 TUNNEL_PORT = 9000
 PUBLIC_PORT = 8080
 REASONS = {400: "Bad Request", 502: "Bad Gateway"}
-REQUEST_TIMEOUT = 30  # seconds to wait for a response before giving up
+REQUEST_TIMEOUT = 30
+REGISTER_ID = 0
 
 log = logging.getLogger("relay")
 
 
 class Tunnel:
-    def __init__(self, reader, writer):
+    def __init__(self, subdomain, reader, writer):
+        self.subdomain = subdomain
         self.reader, self.writer = reader, writer
         self.closed = asyncio.Event()
-        self.pending: dict[int, asyncio.Future] = {}  # request_id -> Future waiting for its reply
-        self.write_lock = asyncio.Lock()               # only guards the moment of writing
+        self.pending: dict[int, asyncio.Future] = {}
+        self.write_lock = asyncio.Lock()
         self._next_id = 0
 
     def next_id(self) -> int:
@@ -28,7 +30,6 @@ class Tunnel:
             return
         self.writer.close()
         self.closed.set()
-        # nobody left waiting should hang forever if the tunnel dies
         for fut in self.pending.values():
             if not fut.done():
                 fut.set_exception(ConnectionError("tunnel closed"))
@@ -49,42 +50,72 @@ async def read_http_request(reader):
     head = await reader.readuntil(b"\r\n\r\n")
     lines = head[:-4].split(b"\r\n")
     request_line, kept, content_length = lines[0], [], 0
+    host_header = None
     for line in lines[1:]:
         name, _, value = line.partition(b":")
         name = name.strip().lower()
+        value = value.strip()
         if name == b"content-length":
             content_length = int(value)
+        if name == b"host":
+            host_header = value.decode(errors="replace")
         if name in (b"connection", b"proxy-connection", b"keep-alive"):
             continue
         kept.append(line)
     kept.append(b"Connection: close")
     body = await reader.readexactly(content_length) if content_length else b""
     request = b"\r\n".join([request_line] + kept) + b"\r\n\r\n" + body
-    return request, request_line.decode(errors="replace")
+    return request, request_line.decode(errors="replace"), host_header
+
+
+def extract_subdomain(host_header: str | None) -> str | None:
+    """'abc.tunnelit.local:8080' -> 'abc'. Returns None if we can't parse one."""
+    if not host_header:
+        return None
+    hostname = host_header.split(":")[0]   # drop the port if present
+    parts = hostname.split(".")
+    if len(parts) < 2:
+        return None                        # no subdomain present, e.g. just "localhost"
+    return parts[0]
 
 
 class Relay:
     def __init__(self):
-        self.tunnel: Tunnel | None = None
+        self.tunnels: dict[str, Tunnel] = {}
 
     async def handle_tunnel(self, reader, writer):
-        """One coroutine per tunnel connection. This is now the ONLY
-        place that reads from the tunnel — it runs for the tunnel's
-        entire lifetime, continuously pulling responses off the wire
-        and routing each one to whoever is waiting for that request_id."""
         peer = writer.get_extra_info("peername")
-        if self.tunnel:
-            log.info("new client replaces old tunnel")
-            self.tunnel.close()
-        tunnel = self.tunnel = Tunnel(reader, writer)
-        log.info("tunnel client registered from %s", peer)
+
+        # Registration handshake: the very first message MUST be a registration.
+        try:
+            request_id, payload = await recv_msg(reader)
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            writer.close()
+            return
+        if request_id != REGISTER_ID:
+            log.warning("client %s skipped registration, closing", peer)
+            writer.close()
+            return
+        subdomain = payload.decode(errors="replace").strip()
+        if not subdomain:
+            log.warning("client %s sent empty subdomain, closing", peer)
+            writer.close()
+            return
+
+        if subdomain in self.tunnels:
+            log.info("subdomain %r reconnecting, replacing old tunnel", subdomain)
+            self.tunnels[subdomain].close()
+
+        tunnel = Tunnel(subdomain, reader, writer)
+        self.tunnels[subdomain] = tunnel
+        log.info("tunnel registered: subdomain=%r from %s", subdomain, peer)
 
         try:
             while True:
                 request_id, payload = await recv_msg(reader)
                 fut = tunnel.pending.pop(request_id, None)
                 if fut is None:
-                    log.warning("response for unknown/expired request_id=%d", request_id)
+                    log.warning("response for unknown/expired request_id=%d on %r", request_id, subdomain)
                     continue
                 if not fut.done():
                     fut.set_result(payload)
@@ -92,21 +123,26 @@ class Relay:
             pass
         finally:
             tunnel.close()
-            if self.tunnel is tunnel:
-                self.tunnel = None
-            log.info("tunnel from %s closed", peer)
+            if self.tunnels.get(subdomain) is tunnel:
+                del self.tunnels[subdomain]
+            log.info("tunnel closed: subdomain=%r from %s", subdomain, peer)
 
     async def handle_public(self, reader, writer):
         try:
-            request, request_line = await read_http_request(reader)
+            request, request_line, host_header = await read_http_request(reader)
         except Exception as e:
             log.warning("bad public request: %r", e)
             await respond(writer, 400, "Bad request")
             return
 
-        tunnel = self.tunnel
+        subdomain = extract_subdomain(host_header)
+        if subdomain is None:
+            await respond(writer, 400, f"Missing or invalid Host header: {host_header!r}")
+            return
+
+        tunnel = self.tunnels.get(subdomain)
         if tunnel is None:
-            await respond(writer, 502, "No tunnel client connected")
+            await respond(writer, 502, f"No tunnel registered for subdomain {subdomain!r}")
             return
 
         request_id = tunnel.next_id()
@@ -114,7 +150,7 @@ class Relay:
         tunnel.pending[request_id] = fut
 
         try:
-            async with tunnel.write_lock:          # only the write itself is serialized
+            async with tunnel.write_lock:
                 await send_msg(tunnel.writer, request_id, request)
             response = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT)
         except asyncio.TimeoutError:
@@ -125,7 +161,7 @@ class Relay:
             await respond(writer, 502, "Tunnel connection lost")
             return
 
-        log.info("%s (id=%d) -> %d bytes back", request_line, request_id, len(response))
+        log.info("%s (subdomain=%s, id=%d) -> %d bytes back", request_line, subdomain, request_id, len(response))
         writer.write(response)
         await writer.drain()
         writer.close()
@@ -133,8 +169,8 @@ class Relay:
 
 async def main():
     relay = Relay()
-    tunnel_srv = await asyncio.start_server(relay.handle_tunnel, "0.0.0.0", TUNNEL_PORT)
-    public_srv = await asyncio.start_server(relay.handle_public, "0.0.0.0", PUBLIC_PORT)
+    tunnel_srv = await asyncio.start_server(relay.handle_tunnel, "0.0.0.0", TUNNEL_PORT, reuse_address=True)
+    public_srv = await asyncio.start_server(relay.handle_public, "0.0.0.0", PUBLIC_PORT, reuse_address=True)
     log.info("tunnel port %d, public port %d", TUNNEL_PORT, PUBLIC_PORT)
     async with tunnel_srv, public_srv:
         await asyncio.gather(tunnel_srv.serve_forever(), public_srv.serve_forever())
