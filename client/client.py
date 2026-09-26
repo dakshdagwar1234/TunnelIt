@@ -16,23 +16,37 @@ async def forward_to_local(host, port, request: bytes) -> bytes:
         return BAD_GATEWAY
     writer.write(request)
     await writer.drain()
-    response = await reader.read()        # read until EOF (Connection: close)
+    response = await reader.read()
     writer.close()
     return response
+
+
+async def handle_one_request(write_lock, tunnel_writer, request_id, request, local_host, local_port):
+    """Runs as its own task per incoming request, so slow requests
+    don't block fast ones — this is what makes the client concurrent."""
+    log.info("request id=%d: %s", request_id, request.split(b"\r\n", 1)[0].decode(errors="replace"))
+    response = await forward_to_local(local_host, local_port, request)
+    async with write_lock:                  # only the write itself is serialized
+        await send_msg(tunnel_writer, request_id, response)
+    log.info("request id=%d: responded, %d bytes", request_id, len(response))
 
 
 async def main(args):
     reader, writer = await asyncio.open_connection(args.relay_host, args.relay_port)
     log.info("connected to relay %s:%d", args.relay_host, args.relay_port)
+    write_lock = asyncio.Lock()
+
     while True:
         try:
             request_id, request = await recv_msg(reader)
         except asyncio.IncompleteReadError:
             log.info("relay closed the tunnel")
             return
-        log.info("request: %s", request.split(b"\r\n", 1)[0].decode(errors="replace"))
-        response = await forward_to_local(args.local_host, args.local_port, request)
-        await send_msg(writer, request_id, response)
+        # fire-and-forget: don't await this, so the next incoming
+        # request can start being handled immediately
+        asyncio.create_task(
+            handle_one_request(write_lock, writer, request_id, request, args.local_host, args.local_port)
+        )
 
 
 if __name__ == "__main__":
