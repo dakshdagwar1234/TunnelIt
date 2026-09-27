@@ -9,6 +9,7 @@ PUBLIC_PORT = 8080
 REASONS = {400: "Bad Request", 502: "Bad Gateway"}
 REQUEST_TIMEOUT = 30
 REGISTER_ID = 0
+HEARTBEAT_ID = 0xFFFFFFFF
 
 log = logging.getLogger("relay")
 
@@ -127,6 +128,8 @@ class Relay:
         try:
             while True:
                 request_id, payload = await recv_msg(reader)
+                if request_id == HEARTBEAT_ID:
+                    continue
                 fut = tunnel.pending.pop(request_id, None)
                 if fut is None:
                     log.warning("response for unknown/expired request_id=%d on %r", request_id, subdomain)
