@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from protocol.basic import send_msg, recv_msg
+from relay.tokens import ALLOWED_TOKENS
 
 TUNNEL_PORT = 9000
 PUBLIC_PORT = 8080
@@ -69,13 +70,12 @@ async def read_http_request(reader):
 
 
 def extract_subdomain(host_header: str | None) -> str | None:
-    """'abc.tunnelit.local:8080' -> 'abc'. Returns None if we can't parse one."""
     if not host_header:
         return None
-    hostname = host_header.split(":")[0]   # drop the port if present
+    hostname = host_header.split(":")[0]
     parts = hostname.split(".")
     if len(parts) < 2:
-        return None                        # no subdomain present, e.g. just "localhost"
+        return None
     return parts[0]
 
 
@@ -86,19 +86,32 @@ class Relay:
     async def handle_tunnel(self, reader, writer):
         peer = writer.get_extra_info("peername")
 
-        # Registration handshake: the very first message MUST be a registration.
         try:
             request_id, payload = await recv_msg(reader)
         except (asyncio.IncompleteReadError, ConnectionError, OSError):
             writer.close()
             return
+
         if request_id != REGISTER_ID:
             log.warning("client %s skipped registration, closing", peer)
             writer.close()
             return
-        subdomain = payload.decode(errors="replace").strip()
+
+        try:
+            token, subdomain = payload.decode(errors="replace").split(":", 1)
+        except ValueError:
+            log.warning("client %s sent malformed registration, closing", peer)
+            writer.close()
+            return
+        subdomain = subdomain.strip()
+
+        if token not in ALLOWED_TOKENS:
+            log.warning("client %s failed auth (bad token), closing", peer)
+            await send_msg(writer, REGISTER_ID, b"AUTH_FAILED")
+            writer.close()
+            return
         if not subdomain:
-            log.warning("client %s sent empty subdomain, closing", peer)
+            await send_msg(writer, REGISTER_ID, b"EMPTY_SUBDOMAIN")
             writer.close()
             return
 
@@ -108,6 +121,7 @@ class Relay:
 
         tunnel = Tunnel(subdomain, reader, writer)
         self.tunnels[subdomain] = tunnel
+        await send_msg(writer, REGISTER_ID, b"OK")
         log.info("tunnel registered: subdomain=%r from %s", subdomain, peer)
 
         try:

@@ -8,7 +8,7 @@ log = logging.getLogger("client")
 BAD_GATEWAY = (b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 27\r\n"
                b"Connection: close\r\n\r\nLocal server not reachable\n")
 
-REGISTER_ID = 0  # reserved request_id meaning "this is a registration message, not a real request"
+REGISTER_ID = 0
 
 
 async def forward_to_local(host, port, request: bytes) -> bytes:
@@ -35,8 +35,15 @@ async def main(args):
     reader, writer = await asyncio.open_connection(args.relay_host, args.relay_port)
     log.info("connected to relay %s:%d", args.relay_host, args.relay_port)
 
-    # Registration handshake: tell the relay which subdomain we want to be.
-    await send_msg(writer, REGISTER_ID, args.subdomain.encode())
+    registration = f"{args.token}:{args.subdomain}".encode()
+    await send_msg(writer, REGISTER_ID, registration)
+
+    # The relay replies with one control message: b"OK" or an error reason.
+    _, ack = await recv_msg(reader)
+    if ack != b"OK":
+        log.error("registration rejected: %s", ack.decode(errors="replace"))
+        writer.close()
+        return
     log.info("registered as subdomain %r", args.subdomain)
 
     write_lock = asyncio.Lock()
@@ -57,6 +64,7 @@ if __name__ == "__main__":
     p.add_argument("--relay-port", type=int, default=9000)
     p.add_argument("--local-host", default="127.0.0.1")
     p.add_argument("--local-port", type=int, default=3000)
-    p.add_argument("--subdomain", required=True, help="e.g. 'abc' for abc.tunnelit.local")
+    p.add_argument("--subdomain", required=True)
+    p.add_argument("--token", required=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     asyncio.run(main(p.parse_args()))
