@@ -40,9 +40,7 @@ async def handle_one_request(write_lock, tunnel_writer, request_id, request, loc
 
 
 async def heartbeat_loop(write_lock, writer):
-    """Periodically pings the relay so a silently-dead connection
-    (e.g. a WiFi drop with no clean TCP close) gets detected
-    proactively instead of only when a real request happens to fail."""
+    
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
         try:
@@ -53,8 +51,7 @@ async def heartbeat_loop(write_lock, writer):
 
 
 async def run_one_session(args) -> None:
-    """One full connect -> register -> serve session. Raises on any
-    failure so main()'s reconnect loop can catch it and retry."""
+    
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(args.relay_host, args.relay_port), timeout=CONNECT_TIMEOUT
     )

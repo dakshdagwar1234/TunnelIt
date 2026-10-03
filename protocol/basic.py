@@ -5,7 +5,7 @@ MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MB safety cap
 
 
 def encode_msg(request_id: int, payload: bytes) -> bytes:
-    """Build one complete framed message: header + payload."""
+    
     if len(payload) > MAX_PAYLOAD:
         raise ValueError(f"payload too large: {len(payload)} bytes")
     return HEADER.pack(len(payload), request_id) + payload
@@ -17,10 +17,7 @@ async def send_msg(writer, request_id: int, payload: bytes) -> None:
 
 
 async def recv_msg(reader):
-    """Read exactly one framed message from an asyncio StreamReader.
-    Returns (request_id, payload).
-    Raises asyncio.IncompleteReadError if the connection closes mid-message.
-    """
+    
     header = await reader.readexactly(HEADER.size)
     length, request_id = HEADER.unpack(header)
     if length > MAX_PAYLOAD:
@@ -30,9 +27,7 @@ async def recv_msg(reader):
 
 
 class Decoder:
-    """Incremental decoder for framed messages, for feeding raw bytes
-    that arrive in arbitrary chunks (simulates real TCP behavior),
-    without needing a live socket. Used only by tests."""
+    
 
     def __init__(self):
         self._buf = bytearray()
